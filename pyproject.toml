@@ -23,6 +23,7 @@ dependencies = [
                   "requests",
                   "urllib3",
                   "Pillow",
+                  "plotly",
 
 ]
 
