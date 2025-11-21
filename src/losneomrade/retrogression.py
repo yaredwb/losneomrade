@@ -11,8 +11,10 @@ import rasterio
 from matplotlib import pyplot as plt
 from matplotlib.colors import LightSource
 from PIL import Image
-from scipy.ndimage import binary_dilation
-from tqdm.notebook import tqdm
+from scipy.ndimage import binary_dilation, label, find_objects
+from tqdm.auto import tqdm
+from multiprocessing import Pool
+from functools import partial
 
 from . import utils
 
@@ -27,6 +29,7 @@ def run_retrogression(bounds: tuple,
                       min_slope: float = 1 / 15,
                       min_height: float = 5,
                       min_length: float = 75,
+                      slope_chunk_size: int = 1000,
                       custom_raster=None,
                       return_animation=False,
                       verbose=True) -> gpd.GeoDataFrame:
@@ -43,6 +46,8 @@ def run_retrogression(bounds: tuple,
                             Default is 1/15 as in NVE's guidelines
         min_height (float): minimum height for checking the slope criterion. Default is 5 m.
         min_length (float): minimum length of the landslide (slope not checked within this length). Default is 75 m.
+        slope_chunk_size (int): chunk size for slope calculation to lower memory/CPU peaks without
+                                changing results. Uses utils.compute_slope_chunked. Default is 1000.
         custom_raster (np.ndarray): custom raster to use for the calculation. Default is None.
         return_animation (bool): wheter to return the animation of the retrogression. Default is False.
         verbose (bool): wheter to print progress. Default is True.
@@ -71,11 +76,133 @@ def run_retrogression(bounds: tuple,
     release, anim = landslide_retrogression(
         dem_array, rel, dem_profile["transform"], initial_release_depth=point_depth,
         min_slope=min_slope, min_height=min_height, min_length=min_length, mask=mask_msml,
-        verbose=verbose)
+        verbose=verbose, slope_chunk_size=slope_chunk_size)
 
     akt = utils.polygonize_results(release, dem_profile, field="slope").to_crs(epsg=25833)
     if return_animation:
         akt = (akt, anim)
+    return akt
+
+
+def _process_component(args):
+    """
+    Helper function for parallel processing of retrogression components.
+    """
+    (dem_crop, rel_crop, transform_crop, depth, min_slope, min_height, min_length, mask_crop, slope_chunk_size) = args
+    
+    # Run retrogression on the crop
+    result, _ = landslide_retrogression(
+        dem_crop, rel_crop, transform_crop,
+        initial_release_depth=depth,
+        min_slope=min_slope,
+        min_height=min_height,
+        min_length=min_length,
+        mask=mask_crop,
+        verbose=False,
+        slope_chunk_size=slope_chunk_size,
+    )
+    return result
+
+
+def run_retrogression_parallel(bounds: tuple,
+                               rel_shape: gpd.GeoDataFrame,
+                               point_depth: float = 0.0,
+                               clip_to_msml=False,
+                               min_slope: float = 1 / 15,
+                               min_height: float = 5,
+                               min_length: float = 75,
+                               slope_chunk_size: int = 1000,
+                               custom_raster=None,
+                               n_processes: int = None,
+                               buffer_pixels: int = 50) -> gpd.GeoDataFrame:
+    """
+    Parallel version of run_retrogression.
+    Splits the initial release area into connected components and processes them in parallel.
+    NOTE: This version processes components independently and may produce different results
+    than the baseline if components are close enough to interact during retrogression.
+    Use run_retrogression_parallel_grouped for accurate results.
+    slope_chunk_size is forwarded to landslide_retrogression to speed up slope checks without affecting outputs.
+    """
+    if custom_raster is None:
+        dem_data = utils.get_hoydedata(bounds)
+    else:
+        dem_data = utils.generate_windows(custom_raster)
+
+    dem_array = dem_data["full_array"]
+    dem_profile = dem_data["profile"]
+    dem_transform = dem_profile["transform"]
+
+    if clip_to_msml:
+        mask_gpd = utils.get_msml_mask((bounds[0], bounds[2], bounds[1], bounds[3]))
+        mask_msml = utils.rasterize_shape(mask_gpd, dem_profile)
+    else:
+        mask_msml = None
+
+    # Rasterize release shape
+    rel = utils.rasterize_shape(rel_shape, dem_profile)
+    
+    # Label connected components
+    labeled_array, num_features = label(rel)
+    
+    if num_features == 0:
+        return gpd.GeoDataFrame(columns=["geometry", "slope"], crs=25833)
+        
+    print(f"Processing {num_features} independent release zones in parallel...")
+    
+    # Prepare tasks with component index tracking
+    tasks = []
+    task_indices = []
+    slices = find_objects(labeled_array)
+    
+    for i, sl in enumerate(slices):
+        if sl is None: continue
+        
+        y_slice, x_slice = sl
+        y_min = max(0, y_slice.start - buffer_pixels)
+        y_max = min(dem_array.shape[0], y_slice.stop + buffer_pixels)
+        x_min = max(0, x_slice.start - buffer_pixels)
+        x_max = min(dem_array.shape[1], x_slice.stop + buffer_pixels)
+        
+        dem_crop = dem_array[y_min:y_max, x_min:x_max]
+        rel_crop = (labeled_array[y_min:y_max, x_min:x_max] == (i + 1)).astype(np.uint8)
+        
+        if mask_msml is not None:
+            mask_crop = mask_msml[y_min:y_max, x_min:x_max]
+        else:
+            mask_crop = None
+            
+        window = rasterio.windows.Window(col_off=x_min, row_off=y_min, width=x_max-x_min, height=y_max-y_min)
+        transform_crop = rasterio.windows.transform(window, dem_transform)
+        
+        tasks.append((dem_crop, rel_crop, transform_crop, point_depth, min_slope, min_height, min_length, mask_crop, slope_chunk_size))
+        task_indices.append(i)
+        
+    if n_processes is None:
+        import multiprocessing
+        n_processes = max(1, multiprocessing.cpu_count() - 1)
+        
+    with Pool(processes=n_processes) as pool:
+        results = list(tqdm(pool.imap(_process_component, tasks), total=len(tasks), desc="Parallel Progress"))
+        
+    # Merge results
+    full_result = np.zeros_like(rel)
+    
+    for result_idx, component_idx in enumerate(task_indices):
+        sl = slices[component_idx]
+        if sl is None: continue
+        
+        y_slice, x_slice = sl
+        y_min = max(0, y_slice.start - buffer_pixels)
+        y_max = min(dem_array.shape[0], y_slice.stop + buffer_pixels)
+        x_min = max(0, x_slice.start - buffer_pixels)
+        x_max = min(dem_array.shape[1], x_slice.stop + buffer_pixels)
+        
+        full_result[y_min:y_max, x_min:x_max] = np.maximum(
+            full_result[y_min:y_max, x_min:x_max], 
+            results[result_idx]
+        )
+        
+    akt = utils.polygonize_results(full_result, dem_profile, field="slope").to_crs(epsg=25833)
     return akt
 
 
@@ -89,9 +216,10 @@ def run_retrogression_with_initial_landslide(
         retro_slope: list = [1 / 15],
         min_height: float = 5,
         min_length: float = 75,
+        slope_chunk_size: int = 1000,
         custom_raster=None,
         return_animation=False,
-        
+
 ):
     """
     Run landslide retrogression with an initial landslide.
@@ -105,6 +233,8 @@ def run_retrogression_with_initial_landslide(
         retro_slope (float): retrogressive slope of the landslide.
         min_height (float): minimum height for checking the slope criterion. Default is 5 m.
         min_length (float): minimum length of the landslide (slope not checked within this length). Default is 75 m.
+        slope_chunk_size (int): chunk size for slope calculation to lower memory/CPU peaks without
+                                changing results. Uses utils.compute_slope_chunked. Default is 1000.
         custom_raster (np.ndarray): custom raster to use for the calculation. Default is None.
         return_animation (bool): wheter to return the animation of the retrogression. Default is False.
 
@@ -137,14 +267,15 @@ def run_retrogression_with_initial_landslide(
 
     
     release_first, animation_first = landslide_retrogression(
-        dem_array, 
-        rel, dem_profile["transform"], 
+        dem_array,
+        rel, dem_profile["transform"],
         initial_release_depth=point_depth,
-        min_slope=ini_slope, 
-        min_height=min_height, 
-        min_length=min_length_first, 
+        min_slope=ini_slope,
+        min_height=min_height,
+        min_length=min_length_first,
         mask=mask_msml,
-        verbose=False)
+        verbose=False,
+        slope_chunk_size=slope_chunk_size)
 
     if np.all(release_first == rel) or release_first.sum() == 0:
         
@@ -170,7 +301,8 @@ def run_retrogression_with_initial_landslide(
                 max_length=2000,
                 initial_release_depth=0,
                 mask=mask_msml,
-                verbose=False
+                verbose=False,
+                slope_chunk_size=slope_chunk_size
             )
             
 
@@ -215,7 +347,8 @@ def landslide_retrogression(dem: np.ndarray,
                             max_length: float = 2000,
                             initial_release_depth: float = 0,
                             mask: np.ndarray = None,
-                            verbose: bool = False):
+                            verbose: bool = False,
+                            slope_chunk_size: int = 1000):
     """
     Propagates a landslide from a release area in a DEM. Stop criteria is defined by the maximum slope, minimum and
     maximum length of the landslide. The propagation is done iteratively, starting from the release area and moving
@@ -235,6 +368,9 @@ def landslide_retrogression(dem: np.ndarray,
         mask (np.ndarray): mask of the area outside analysis. Must have the same shape and same transform as the DEM.
                             Default is None.
         verbose (bool): wheter to print progress. Default is False.
+        slope_chunk_size (int): chunk size for slope calculation (default 1000). Uses
+                                utils.compute_slope_chunked to keep memory and runtime in check while
+                                preserving baseline results.
 
 
     Returns:
@@ -281,7 +417,12 @@ def landslide_retrogression(dem: np.ndarray,
             buffered_coords = np.c_[x_buffered, y_buffered, z_buffered]
 
             # h_min = 0 if n_iter <= min_iter else min_height
-            slopes = utils.compute_slope(buffered_coords, release_coords, h_min=min_height)
+            if slope_chunk_size is not None:
+                slopes = utils.compute_slope_chunked(
+                    buffered_coords, release_coords, h_min=min_height, chunk_size=slope_chunk_size
+                )
+            else:
+                slopes = utils.compute_slope(buffered_coords, release_coords, h_min=min_height)
 
             if n_iter > min_iter:
                 neighbours_filtered = [(i_buffered[ii], j_buffered[ii]) for ii in
@@ -504,3 +645,235 @@ def save_frames(dem_array: np.ndarray, animation: list, out_dir: str, skip_frame
         fig.savefig(f'{out_dir}\\gif_frame_{ii}.png')
         fig.clf()
     plt.switch_backend(current_backend)
+
+
+# ============================================================================
+# GROUPED PARALLEL RETROGRESSION FUNCTIONS
+# ============================================================================
+
+def _group_nearby_components(slices, max_distance_pixels):
+    """
+    Group components whose bounding boxes (expanded by max_distance) overlap.
+    
+    Args:
+        slices: List of slice objects from scipy.ndimage.find_objects
+        max_distance_pixels: Maximum distance in pixels to expand bounding boxes
+        
+    Returns:
+        List of groups, where each group is a list of component indices
+    """
+    if not slices:
+        return []
+    
+    # Expand each slice by max_distance_pixels
+    expanded_boxes = []
+    for i, sl in enumerate(slices):
+        if sl is None:
+            expanded_boxes.append(None)
+            continue
+            
+        y_slice, x_slice = sl
+        expanded_box = (
+            max(0, y_slice.start - max_distance_pixels),
+            y_slice.stop + max_distance_pixels,
+            max(0, x_slice.start - max_distance_pixels),
+            x_slice.stop + max_distance_pixels
+        )
+        expanded_boxes.append(expanded_box)
+    
+    # Find overlapping boxes using Union-Find
+    parent = list(range(len(slices)))
+    
+    def find(x):
+        if parent[x] != x:
+            parent[x] = find(parent[x])
+        return parent[x]
+    
+    def union(x, y):
+        px, py = find(x), find(y)
+        if px != py:
+            parent[px] = py
+    
+    # Check all pairs for overlap
+    for i in range(len(expanded_boxes)):
+        if expanded_boxes[i] is None:
+            continue
+        for j in range(i + 1, len(expanded_boxes)):
+            if expanded_boxes[j] is None:
+                continue
+                
+            # Check if boxes overlap
+            y1_min, y1_max, x1_min, x1_max = expanded_boxes[i]
+            y2_min, y2_max, x2_min, x2_max = expanded_boxes[j]
+            
+            # Boxes overlap if they intersect in both x and y
+            x_overlap = not (x1_max <= x2_min or x2_max <= x1_min)
+            y_overlap = not (y1_max <= y2_min or y2_max <= y1_min)
+            
+            if x_overlap and y_overlap:
+                union(i, j)
+    
+    # Group components by their root parent
+    groups_dict = {}
+    for i in range(len(slices)):
+        if slices[i] is None:
+            continue
+        root = find(i)
+        if root not in groups_dict:
+            groups_dict[root] = []
+        groups_dict[root].append(i)
+    
+    return list(groups_dict.values())
+
+
+def _process_group(args):
+    """
+    Helper function for parallel processing of component groups.
+    """
+    (dem_crop, rel_crop, transform_crop, depth, min_slope, min_height, min_length, mask_crop, slope_chunk_size) = args
+    
+    # Run retrogression on the group
+    result, _ = landslide_retrogression(
+        dem_crop, rel_crop, transform_crop,
+        initial_release_depth=depth,
+        min_slope=min_slope,
+        min_height=min_height,
+        min_length=min_length,
+        mask=mask_crop,
+        verbose=False,
+        slope_chunk_size=slope_chunk_size,
+    )
+    return result
+
+
+def run_retrogression_parallel_grouped(bounds: tuple,
+                                       rel_shape: gpd.GeoDataFrame,
+                                       point_depth: float = 0.0,
+                                       clip_to_msml=False,
+                                       min_slope: float = 1 / 15,
+                                       min_height: float = 5,
+                                       min_length: float = 75,
+                                       max_length: float = 2000,
+                                       slope_chunk_size: int = 1000,
+                                       custom_raster=None,
+                                       n_processes: int = None,
+                                       buffer_pixels: int = 50) -> gpd.GeoDataFrame:
+    """
+    Parallel version of run_retrogression with distance-based grouping.
+    Groups nearby components that could interact during retrogression, ensuring accurate results.
+    
+    Args:
+        bounds: xmin,xmax,ymin,ymax of the calculation window
+        rel_shape: release area as a geodataframe
+        point_depth: depth of the source points
+        clip_to_msml: whether to clip against MSML
+        min_slope: minimum slope of the landslide
+        min_height: minimum height for checking the slope criterion
+        min_length: minimum length of the landslide
+        max_length: maximum length of the landslide (used for grouping distance)
+        slope_chunk_size: chunk size for slope calculation (default 1000) to keep memory/time down while preserving results
+        custom_raster: custom raster to use for the calculation
+        n_processes: number of parallel processes (default: auto)
+        buffer_pixels: buffer around each group in pixels
+        
+    Returns:
+        akt (gpd.GeoDataFrame): propagated release area
+    """
+    if custom_raster is None:
+        dem_data = utils.get_hoydedata(bounds)
+    else:
+        dem_data = utils.generate_windows(custom_raster)
+
+    dem_array = dem_data["full_array"]
+    dem_profile = dem_data["profile"]
+    dem_transform = dem_profile["transform"]
+    
+    # Get resolution for distance calculation
+    resolution = abs(dem_transform[0])
+    max_distance_pixels = int(max_length / resolution)
+
+    if clip_to_msml:
+        mask_gpd = utils.get_msml_mask((bounds[0], bounds[2], bounds[1], bounds[3]))
+        mask_msml = utils.rasterize_shape(mask_gpd, dem_profile)
+    else:
+        mask_msml = None
+
+    # Rasterize release shape
+    rel = utils.rasterize_shape(rel_shape, dem_profile)
+    
+    # Label connected components
+    labeled_array, num_features = label(rel)
+    
+    if num_features == 0:
+        return gpd.GeoDataFrame(columns=["geometry", "slope"], crs=25833)
+    
+    slices = find_objects(labeled_array)
+    
+    # Group nearby components
+    groups = _group_nearby_components(slices, max_distance_pixels)
+    
+    print(f"Found {num_features} components, grouped into {len(groups)} groups for parallel processing...")
+    
+    # Prepare tasks for each group
+    tasks = []
+    task_groups = []  # Track which group each task corresponds to
+    
+    for group_idx, group in enumerate(groups):
+        # Find combined bounding box for the entire group
+        y_min = min(dem_array.shape[0], *[slices[i][0].start for i in group if slices[i] is not None])
+        y_max = max(0, *[slices[i][0].stop for i in group if slices[i] is not None])
+        x_min = min(dem_array.shape[1], *[slices[i][1].start for i in group if slices[i] is not None])
+        x_max = max(0, *[slices[i][1].stop for i in group if slices[i] is not None])
+        
+        # Add buffer
+        y_min = max(0, y_min - buffer_pixels)
+        y_max = min(dem_array.shape[0], y_max + buffer_pixels)
+        x_min = max(0, x_min - buffer_pixels)
+        x_max = min(dem_array.shape[1], x_max + buffer_pixels)
+        
+        # Crop data for the group
+        dem_crop = dem_array[y_min:y_max, x_min:x_max]
+        
+        # Create release mask for all components in the group
+        rel_crop = np.zeros((y_max - y_min, x_max - x_min), dtype=np.uint8)
+        for comp_idx in group:
+            if slices[comp_idx] is None:
+                continue
+            # Extract component and place it in the cropped array
+            comp_mask = (labeled_array == (comp_idx + 1)).astype(np.uint8)
+            rel_crop = np.maximum(rel_crop, comp_mask[y_min:y_max, x_min:x_max])
+        
+        if mask_msml is not None:
+            mask_crop = mask_msml[y_min:y_max, x_min:x_max]
+        else:
+            mask_crop = None
+            
+        # Calculate transform for the crop
+        window = rasterio.windows.Window(col_off=x_min, row_off=y_min, width=x_max-x_min, height=y_max-y_min)
+        transform_crop = rasterio.windows.transform(window, dem_transform)
+
+        tasks.append((dem_crop, rel_crop, transform_crop, point_depth, min_slope, min_height, min_length, mask_crop, slope_chunk_size))
+        task_groups.append((group_idx, y_min, y_max, x_min, x_max))
+        
+    # Run in parallel
+    if n_processes is None:
+        import multiprocessing
+        n_processes = max(1, multiprocessing.cpu_count() - 1)
+        
+    with Pool(processes=n_processes) as pool:
+        results = list(tqdm(pool.imap(_process_group, tasks), total=len(tasks), desc="Parallel Progress (Grouped)"))
+        
+    # Merge results
+    full_result = np.zeros_like(rel)
+    
+    for result_idx, (group_idx, y_min, y_max, x_min, x_max) in enumerate(task_groups):
+        # Add result back to full array
+        full_result[y_min:y_max, x_min:x_max] = np.maximum(
+            full_result[y_min:y_max, x_min:x_max], 
+            results[result_idx]
+        )
+        
+    # Polygonize
+    akt = utils.polygonize_results(full_result, dem_profile, field="slope").to_crs(epsg=25833)
+    
+    return akt
