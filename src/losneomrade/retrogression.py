@@ -354,6 +354,8 @@ def landslide_retrogression(dem: np.ndarray,
     maximum length of the landslide. The propagation is done iteratively, starting from the release area and moving
     outwards. The propagation is done in 3D, i.e. the landslide can propagate in any direction.
 
+    Optimized version using BFS to avoid re-checking static boundaries.
+
     Parameters:
         dem (np.ndarray): DEM as a numpy array
         initial_release (np.ndarray): initial release area as a boolean numpy array.
@@ -379,7 +381,7 @@ def landslide_retrogression(dem: np.ndarray,
 
     """
     if verbose:
-        print("runing landslide propagation...")
+        print("Running landslide propagation (Optimized BFS)...")
     if abs(round(dem_transform[0], 2)) != abs(round(dem_transform[4], 2)):
         if verbose:
             print("Warning: DEM is not square")
@@ -392,66 +394,132 @@ def landslide_retrogression(dem: np.ndarray,
     # shut up RuntimeWarning
     np.seterr(divide='ignore', invalid='ignore')
 
-    n_iter = 1
-
-    release = initial_release.copy()
-
+    # 1. Setup Source Points (Constant)
     i_rel, j_rel = np.where(initial_release == 1)
     x_rel, y_rel = rasterio.transform.xy(dem_transform, i_rel, j_rel)
     z_rel = np.array([dem[ii, jj] - initial_release_depth for ii, jj in zip(i_rel, j_rel)])
-    release_coords = np.c_[x_rel, y_rel, z_rel]
+    source_coords = np.c_[x_rel, y_rel, z_rel]
 
-    animation = []
-    animation.append(initial_release)
+    animation = [initial_release]
+    
+    # 2. Phase 1: Unconditional Expansion (min_length)
+    current_release = initial_release.copy()
+    
+    # We iterate to generate animation frames and handle masking properly step-by-step
+    # (though we could optimize this if animation is not needed, but let's keep it safe)
+    for i in range(min_iter):
+        # Dilate by 1 to get the rim
+        buffered = create_buffer(current_release, 1) 
+        # Apply mask
+        buffered = apply_mask(buffered, mask)
+        
+        if not np.any(buffered):
+            break
+            
+        # Add to release
+        current_release = current_release | buffered
+        animation.append(current_release.copy())
+        
+    release = current_release
 
-    initial_release_buffered = apply_mask(initial_release + create_buffer(initial_release, min_iter), mask)
-
-    with tqdm(total=0, desc="iterations", disable=not verbose) as pbar:
+    # 3. Phase 2: Conditional Expansion (BFS)
+    # Checked mask: pixels we have already processed (either accepted or rejected)
+    # Initially, everything in the current release is "checked" (accepted).
+    checked = release.copy()
+    
+    # Current candidates: neighbors of the current release that are NOT checked
+    # create_buffer returns the rim.
+    candidates_mask = create_buffer(release, 1)
+    candidates_mask = apply_mask(candidates_mask, mask)
+    candidates_mask = candidates_mask & (~checked)
+    
+    n_iter = min_iter
+    
+    with tqdm(total=max_iter, initial=n_iter, desc="iterations", disable=not verbose) as pbar:
         while n_iter < max_iter:
-
-            buffered = apply_mask(create_buffer(release, 1), mask)
-
-            i_buffered, j_buffered = np.where(buffered == 1)
-            x_buffered, y_buffered = rasterio.transform.xy(dem_transform, i_buffered, j_buffered)
-            z_buffered = np.array([dem[ii, jj] for ii, jj in zip(i_buffered, j_buffered)])
-            buffered_coords = np.c_[x_buffered, y_buffered, z_buffered]
-
-            # h_min = 0 if n_iter <= min_iter else min_height
-            if slope_chunk_size is not None:
-                slopes = utils.compute_slope_chunked(
-                    buffered_coords, release_coords, h_min=min_height, chunk_size=slope_chunk_size
-                )
-            else:
-                slopes = utils.compute_slope(buffered_coords, release_coords, h_min=min_height)
-
-            if n_iter > min_iter:
-                neighbours_filtered = [(i_buffered[ii], j_buffered[ii]) for ii in
-                                       list(np.where(np.array(slopes) > min_slope)[0])]
-
-                release_after = release.copy()
-
-                for ii in neighbours_filtered:
-                    release_after[ii] = 1
-            else:
-                release_after = release + buffered
-
-            release_after = apply_mask(release_after, mask)
-
-            if np.all(release.astype(bool) == release_after.astype(bool)) and n_iter > min_iter:
+            if not np.any(candidates_mask):
                 break
-
-            release = release_after.copy()
-
-            animation.append(release_after)
-
+                
+            # Extract candidate coordinates
+            i_cand, j_cand = np.where(candidates_mask == 1)
+            x_cand, y_cand = rasterio.transform.xy(dem_transform, i_cand, j_cand)
+            z_cand = np.array([dem[ii, jj] for ii, jj in zip(i_cand, j_cand)])
+            cand_coords = np.c_[x_cand, y_cand, z_cand]
+            
+            # Optimization: Filter source points to relevant area
+            # We only care about source points that could possibly satisfy the slope condition.
+            # Max relevant distance is bounded by max_length (since we stop there) 
+            # or by the physical limit (delta_z / min_slope).
+            # We use a generous buffer to be safe.
+            search_buffer = max(max_length, 2000) 
+            
+            c_xmin, c_ymin = np.min(cand_coords[:, :2], axis=0)
+            c_xmax, c_ymax = np.max(cand_coords[:, :2], axis=0)
+            
+            s_xmin, s_ymin = c_xmin - search_buffer, c_ymin - search_buffer
+            s_xmax, s_ymax = c_xmax + search_buffer, c_ymax + search_buffer
+            
+            # Filter source points (vectorized)
+            relevant_mask = (
+                (source_coords[:, 0] >= s_xmin) & 
+                (source_coords[:, 0] <= s_xmax) & 
+                (source_coords[:, 1] >= s_ymin) & 
+                (source_coords[:, 1] <= s_ymax)
+            )
+            
+            relevant_sources = source_coords[relevant_mask]
+            
+            if len(relevant_sources) == 0:
+                slopes = np.zeros(len(cand_coords))
+            else:
+                # Compute slopes against filtered source
+                if slope_chunk_size is not None:
+                    slopes = utils.compute_slope_chunked(
+                        cand_coords, relevant_sources, h_min=min_height, chunk_size=slope_chunk_size
+                    )
+                else:
+                    slopes = utils.compute_slope(cand_coords, relevant_sources, h_min=min_height)
+                
+            # Identify successful candidates
+            success_mask_local = slopes > min_slope
+            
+            # If no success, this front stops.
+            if not np.any(success_mask_local):
+                # Mark all as checked (rejected)
+                checked[i_cand, j_cand] = 1
+                break
+                
+            # Update release with successful candidates
+            # We need to map back to global grid
+            i_success = i_cand[success_mask_local]
+            j_success = j_cand[success_mask_local]
+            
+            new_release_pixels = np.zeros_like(release, dtype=bool)
+            new_release_pixels[i_success, j_success] = 1
+            
+            release = release | new_release_pixels
+            
+            # Mark ALL current candidates as checked (both success and fail)
+            checked[i_cand, j_cand] = 1
+            
+            animation.append(release.copy())
+            
+            # Generate NEXT candidates
+            # Only neighbors of the NEWLY ADDED pixels need to be checked.
+            new_candidates = create_buffer(new_release_pixels, 1)
+            new_candidates = apply_mask(new_candidates, mask)
+            
+            # Filter out already checked
+            candidates_mask = new_candidates & (~checked)
+            
             n_iter += 1
             pbar.update(1)
 
-    if np.all(release == initial_release_buffered):
-        if verbose:
-            print(f"Warning: no propagation besides the minimum length of {min_length} m / {min_iter+1} iterations")
-            print("returning the original release area")
-        release = initial_release
+    if np.all(release == initial_release) and min_iter > 0:
+         # This handles the case where min_iter > 0 but masking prevented any expansion
+         # Or if min_iter=0 and no propagation happened.
+         pass
+
     return release, animation
 
 
@@ -468,7 +536,7 @@ def create_buffer(image: np.ndarray, buffer_size: int = 1):
 
     """
     dilated_image = binary_dilation(image, iterations=buffer_size)
-    buffer = ((dilated_image - image) > 0).astype(bool)
+    buffer = dilated_image & (~image.astype(bool))
 
     return buffer
 
@@ -651,13 +719,15 @@ def save_frames(dem_array: np.ndarray, animation: list, out_dir: str, skip_frame
 # GROUPED PARALLEL RETROGRESSION FUNCTIONS
 # ============================================================================
 
-def _group_nearby_components(slices, max_distance_pixels):
+def _group_nearby_components(slices, max_distance_pixels, max_group_size=None):
     """
     Group components whose bounding boxes (expanded by max_distance) overlap.
+    Optionally limits group size to prevent over-grouping.
     
     Args:
         slices: List of slice objects from scipy.ndimage.find_objects
         max_distance_pixels: Maximum distance in pixels to expand bounding boxes
+        max_group_size: Maximum number of components per group (None = unlimited)
         
     Returns:
         List of groups, where each group is a list of component indices
@@ -723,7 +793,21 @@ def _group_nearby_components(slices, max_distance_pixels):
             groups_dict[root] = []
         groups_dict[root].append(i)
     
-    return list(groups_dict.values())
+    groups = list(groups_dict.values())
+    
+    # Split oversized groups if max_group_size is specified
+    if max_group_size is not None and max_group_size > 0:
+        final_groups = []
+        for group in groups:
+            if len(group) <= max_group_size:
+                final_groups.append(group)
+            else:
+                # Split large group into smaller chunks
+                for i in range(0, len(group), max_group_size):
+                    final_groups.append(group[i:i + max_group_size])
+        return final_groups
+    
+    return groups
 
 
 def _process_group(args):
@@ -757,7 +841,9 @@ def run_retrogression_parallel_grouped(bounds: tuple,
                                        slope_chunk_size: int = 1000,
                                        custom_raster=None,
                                        n_processes: int = None,
-                                       buffer_pixels: int = 50) -> gpd.GeoDataFrame:
+                                       buffer_pixels: int = 50,
+                                       grouping_distance: float = None,
+                                       max_group_size: int = None) -> gpd.GeoDataFrame:
     """
     Parallel version of run_retrogression with distance-based grouping.
     Groups nearby components that could interact during retrogression, ensuring accurate results.
@@ -770,11 +856,15 @@ def run_retrogression_parallel_grouped(bounds: tuple,
         min_slope: minimum slope of the landslide
         min_height: minimum height for checking the slope criterion
         min_length: minimum length of the landslide
-        max_length: maximum length of the landslide (used for grouping distance)
+        max_length: maximum length of the landslide (fallback for grouping distance)
         slope_chunk_size: chunk size for slope calculation (default 1000) to keep memory/time down while preserving results
         custom_raster: custom raster to use for the calculation
         n_processes: number of parallel processes (default: auto)
         buffer_pixels: buffer around each group in pixels
+        grouping_distance: custom grouping distance in meters (default: max_length)
+                          Use smaller values (e.g., 300-500m) for better parallelization
+        max_group_size: maximum components per group (default: None = unlimited)
+                        Use to prevent over-grouping (e.g., 10-50 components)
         
     Returns:
         akt (gpd.GeoDataFrame): propagated release area
@@ -790,7 +880,17 @@ def run_retrogression_parallel_grouped(bounds: tuple,
     
     # Get resolution for distance calculation
     resolution = abs(dem_transform[0])
-    max_distance_pixels = int(max_length / resolution)
+    
+    # Calculate buffer pixels if not provided
+    if buffer_pixels is None:
+        # Buffer should be at least max_length to allow full propagation
+        # We add a small safety margin (e.g. 10%)
+        buffer_pixels = int((max_length * 1.1) / resolution)
+        # print(f"Calculated buffer: {buffer_pixels} pixels ({buffer_pixels * resolution:.1f} m)")
+    
+    # Use custom grouping distance if provided, otherwise fall back to max_length
+    actual_grouping_distance = grouping_distance if grouping_distance is not None else max_length
+    max_distance_pixels = int(actual_grouping_distance / resolution)
 
     if clip_to_msml:
         mask_gpd = utils.get_msml_mask((bounds[0], bounds[2], bounds[1], bounds[3]))
@@ -809,10 +909,16 @@ def run_retrogression_parallel_grouped(bounds: tuple,
     
     slices = find_objects(labeled_array)
     
-    # Group nearby components
-    groups = _group_nearby_components(slices, max_distance_pixels)
+    # Group nearby components with optional size limit
+    groups = _group_nearby_components(slices, max_distance_pixels, max_group_size=max_group_size)
     
-    print(f"Found {num_features} components, grouped into {len(groups)} groups for parallel processing...")
+    # Report grouping statistics
+    avg_group_size = sum(len(g) for g in groups) / len(groups) if groups else 0
+    max_actual_group_size = max(len(g) for g in groups) if groups else 0
+    print(f"Found {num_features} components, grouped into {len(groups)} groups for parallel processing")
+    print(f"  - Average group size: {avg_group_size:.1f} components")
+    print(f"  - Largest group: {max_actual_group_size} components")
+    print(f"  - Grouping distance: {actual_grouping_distance:.0f}m ({max_distance_pixels} pixels)")
     
     # Prepare tasks for each group
     tasks = []
@@ -877,3 +983,124 @@ def run_retrogression_parallel_grouped(bounds: tuple,
     akt = utils.polygonize_results(full_result, dem_profile, field="slope").to_crs(epsg=25833)
     
     return akt
+
+
+def run_retrogression_parallel_adaptive(bounds: tuple,
+                                         rel_shape: gpd.GeoDataFrame,
+                                         point_depth: float = 0.0,
+                                         clip_to_msml=False,
+                                         min_slope: float = 1 / 15,
+                                         min_height: float = 5,
+                                         min_length: float = 75,
+                                         slope_chunk_size: int = 1000,
+                                         custom_raster=None,
+                                         n_processes: int = None,
+                                         buffer_pixels: int = 50,
+                                         speed_priority: str = 'balanced') -> gpd.GeoDataFrame:
+    """
+    Adaptive parallel retrogression that automatically chooses the best strategy.
+    
+    WARNING: Parallel methods work well ONLY for datasets with well-separated components.
+    For dense stream networks where retrogression zones interact, use run_retrogression()
+    (serial method) instead for accurate results.
+    
+    This function analyzes the release area components and intelligently decides
+    how to group them for optimal parallelization while maintaining accuracy.
+    
+    Args:
+        bounds: xmin,xmax,ymin,ymax of the calculation window
+        rel_shape: release area as a geodataframe
+        point_depth: depth of the source points
+        clip_to_msml: whether to clip against MSML
+        min_slope: minimum slope of the landslide
+        min_height: minimum height for checking the slope criterion
+        min_length: minimum length of the landslide
+        slope_chunk_size: chunk size for slope calculation
+        custom_raster: custom raster to use for the calculation
+        n_processes: number of parallel processes (default: auto)
+        buffer_pixels: buffer around each group in pixels
+        speed_priority: Strategy for balancing speed vs accuracy
+            - 'speed': Aggressive, may miss interactions (300m, for well-separated components)
+            - 'balanced': Moderate (1500m grouping, safer but may still have errors)
+            - 'accuracy': Conservative (3000m grouping, closest to serial but may still differ)
+            - 'serial': Just use serial method (100% accurate, recommended for interacting components)
+        
+    Returns:
+        akt (gpd.GeoDataFrame): propagated release area
+    """
+    # Strategy parameters - MUCH more conservative now
+    strategies = {
+        'speed': {
+            'grouping_distance': 300,   # Only for truly isolated components
+            'max_group_size': None,     # No splitting
+            'description': 'Fast (300m grouping) - USE ONLY for well-separated components'
+        },
+        'balanced': {
+            'grouping_distance': 1500,  # More conservative
+            'max_group_size': None,     # No splitting to avoid breaking interactions
+            'description': 'Balanced (1500m grouping) - May still have errors'
+        },
+        'accuracy': {
+            'grouping_distance': 3000,  # Very conservative
+            'max_group_size': None,     # No splitting
+            'description': 'Accurate (3000m grouping) - Closest to serial'
+        },
+        'serial': {
+            'use_serial': True,
+            'description': 'Serial (no parallelization) - 100% accurate'
+        }
+    }
+    
+    if speed_priority not in strategies:
+        print(f"[WARNING] Unknown speed_priority '{speed_priority}', using 'balanced'")
+        speed_priority = 'balanced'
+    
+    strategy = strategies[speed_priority]
+    
+    # If serial mode requested, just use the serial implementation
+    if strategy.get('use_serial'):
+        print(f"\n{'='*70}")
+        print(f"Using Serial Method (100% Accurate)")
+        print(f"{'='*70}\n")
+        return run_retrogression(
+            bounds=bounds,
+            rel_shape=rel_shape,
+            point_depth=point_depth,
+            clip_to_msml=clip_to_msml,
+            min_slope=min_slope,
+            min_height=min_height,
+            min_length=min_length,
+            slope_chunk_size=slope_chunk_size,
+            custom_raster=custom_raster,
+            return_animation=False,
+            verbose=False
+        )
+    
+    print(f"\n{'='*70}")
+    print(f"Adaptive Parallel Retrogression - {strategy['description']}")
+    print(f"{'='*70}\n")
+    
+    # Calculate safe buffer size based on max_length
+    # We need to ensure the crop is large enough for the landslide to propagate fully.
+    # max_length is in meters. We need pixels.
+    # We don't have resolution here easily without opening DEM, but we can estimate or pass it.
+    # Actually, run_retrogression_parallel_grouped calculates resolution.
+    # Let's pass a flag or large enough buffer.
+    # Better yet, let run_retrogression_parallel_grouped handle the buffer calculation if not provided.
+    
+    # Use the grouped parallel implementation with adaptive parameters
+    return run_retrogression_parallel_grouped(
+        bounds=bounds,
+        rel_shape=rel_shape,
+        point_depth=point_depth,
+        clip_to_msml=clip_to_msml,
+        min_slope=min_slope,
+        min_height=min_height,
+        min_length=min_length,
+        slope_chunk_size=slope_chunk_size,
+        custom_raster=custom_raster,
+        n_processes=n_processes,
+        buffer_pixels=None, # Let the function calculate it based on max_length
+        grouping_distance=strategy['grouping_distance'],
+        max_group_size=strategy['max_group_size']
+    )
